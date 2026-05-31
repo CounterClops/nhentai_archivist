@@ -10,6 +10,11 @@ on:
             -   "*" # execute every time tag is pushed
 
 
+permissions:
+    contents: write # create releases and upload release assets to the current repo
+    packages: write # push docker image to the current repo's GitHub Container Registry namespace
+
+
 jobs:
     initialisation:
         name: "Initialisation"
@@ -39,11 +44,16 @@ jobs:
                 id: "today"
                 run: "echo \"TODAY=$(date +'%Y-%m-%d')\" >> $GITHUB_OUTPUT" # get date, save in TODAY, push to output
 
+            -   name: "OWNER_LC"
+                id: "owner_lc"
+                run: "echo \"OWNER_LC=${GITHUB_REPOSITORY_OWNER,,}\" >> $GITHUB_OUTPUT" # lowercase repo owner (ghcr.io requires lowercase), so the docker image publishes to the current repo's namespace
+
         outputs:    # set step output as job output so other jobs can access
             NOW: ${{steps.now.outputs.NOW}}
             TAG: ${{steps.tag.outputs.TAG}}
             TAG_PREVIOUS: ${{steps.tag_previous.outputs.TAG_PREVIOUS}}
             TODAY: ${{steps.today.outputs.TODAY}}
+            OWNER_LC: ${{steps.owner_lc.outputs.OWNER_LC}}
 
 
     test:
@@ -175,10 +185,10 @@ jobs:
                 run: "mkdir -p \"./target/\""
 
             -   name: "Compile"
-                run: "docker build -t \"ghcr.io/9-fs/${{env.REPO_NAME}}:${{needs.initialisation.outputs.TAG}}\" --no-cache ."
+                run: "docker build -t \"ghcr.io/${{needs.initialisation.outputs.OWNER_LC}}/${{env.REPO_NAME}}:${{needs.initialisation.outputs.TAG}}\" --no-cache ."
 
             -   name: "Save Docker Image"
-                run: "docker save \"ghcr.io/9-fs/${{env.REPO_NAME}}:${{needs.initialisation.outputs.TAG}}\" > \"./target/docker-image.tar\""
+                run: "docker save \"ghcr.io/${{needs.initialisation.outputs.OWNER_LC}}/${{env.REPO_NAME}}:${{needs.initialisation.outputs.TAG}}\" > \"./target/docker-image.tar\""
 
             -   name: "Cache Docker Image"
                 uses: "actions/cache/save@v4"
@@ -263,13 +273,13 @@ jobs:
                 run: "docker load < \"./target/docker-image.tar\""
 
             -   name: "Add \"latest\" Tag to Docker Image"
-                run: "docker tag \"ghcr.io/9-fs/${{env.REPO_NAME}}:${{needs.initialisation.outputs.TAG}}\" \"ghcr.io/9-fs/${{env.REPO_NAME}}:latest\""
+                run: "docker tag \"ghcr.io/${{needs.initialisation.outputs.OWNER_LC}}/${{env.REPO_NAME}}:${{needs.initialisation.outputs.TAG}}\" \"ghcr.io/${{needs.initialisation.outputs.OWNER_LC}}/${{env.REPO_NAME}}:latest\""
 
             -   name: "Log In to GitHub Docker Registry"
-                run: "echo ${{secrets.GITHUB_TOKEN}} | docker login ghcr.io -u \"9-FS\" --password-stdin"
+                run: "echo ${{secrets.GITHUB_TOKEN}} | docker login ghcr.io -u \"${{github.actor}}\" --password-stdin"
 
             -   name: "Push Docker Image to GitHub Docker Registry"
-                run: "docker push \"ghcr.io/9-fs/${{env.REPO_NAME}}:${{needs.initialisation.outputs.TAG}}\""
+                run: "docker push \"ghcr.io/${{needs.initialisation.outputs.OWNER_LC}}/${{env.REPO_NAME}}:${{needs.initialisation.outputs.TAG}}\""
 
             -   name: "Push Docker Image to GitHub Docker Registry"
-                run: "docker push \"ghcr.io/9-fs/${{env.REPO_NAME}}:latest\""
+                run: "docker push \"ghcr.io/${{needs.initialisation.outputs.OWNER_LC}}/${{env.REPO_NAME}}:latest\""

@@ -294,15 +294,20 @@ impl Hentai
         {
             tokio::fs::DirBuilder::new().recursive(true).create(std::path::Path::new(format!("{}{}", self.library_path, self.id).as_str())).await?; // create all parent directories
         }
-        tokio::fs::write(cbz_temp_filepath.as_str(), &cbz_bytes).await?; // write downloaded cbz to temporary location
-
-        let cbz_file: std::fs::File = std::fs::OpenOptions::new().read(true).write(true).open(cbz_temp_filepath.as_str())?; // open temporary cbz for in place modification
+        let cbz_file: std::fs::File = std::fs::OpenOptions::new().create(true).truncate(true).read(true).write(true).open(cbz_temp_filepath.as_str())?; // create temporary cbz to write rebuilt archive into
         #[cfg(target_family = "unix")]
         if let Err(e) = cbz_file.set_permissions(std::fs::Permissions::from_mode(0o666)) // set permissions "rw-rw-rw-"
         {
             log::warn!("Setting permissions \"rw-rw-rw-\" for hentai {} failed with: {e}", self.id);
         }
-        let mut zip_writer: zip::ZipWriter<std::fs::File> = zip::ZipWriter::new_append(cbz_file)?; // append to existing cbz
+        let mut zip_reader: zip::ZipArchive<std::io::Cursor<&[u8]>> = zip::ZipArchive::new(std::io::Cursor::new(cbz_bytes.as_ref()))?; // read downloaded cbz from memory
+        let mut zip_writer: zip::ZipWriter<std::fs::File> = zip::ZipWriter::new(cbz_file); // write rebuilt cbz
+        for i in 0..zip_reader.len() // copy all existing files except an already present ComicInfo.xml, which would otherwise cause a duplicate filename
+        {
+            let file = zip_reader.by_index(i)?; // existing file in downloaded cbz
+            if file.name() == "ComicInfo.xml" {continue;} // skip existing ComicInfo.xml, it is replaced below
+            zip_writer.raw_copy_file(file)?; // copy file verbatim without recompressing
+        }
         #[cfg(target_family = "unix")]
         zip_writer.start_file("ComicInfo.xml", zip::write::SimpleFileOptions::default().unix_permissions(0o666))?; // create metadata file in cbz with permissions "rw-rw-rw-"
         #[cfg(not(target_family = "unix"))]

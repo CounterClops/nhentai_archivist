@@ -10,8 +10,12 @@ pub async fn main_inner(config: Config) -> Result<(), Error>
 {
     const DB_FILEPATH: &str = "./db/db.sqlite"; // database filepath
     const HTTP_TIMEOUT: u64 = 10; // connection timeout
-    const NHENTAI_HENTAI_SEARCH_URL: &str = "https://nhentai.net/api/gallery/"; // nhentai search by id api url
-    const NHENTAI_TAG_SEARCH_URL: &str = "https://nhentai.net/api/galleries/search"; // nhentai search by tag api url
+    const NHENTAI_CDN_URL: &str = "https://nhentai.net/api/v2/cdn"; // nhentai v2 cdn config api url, also used as cheap public health check endpoint
+    const NHENTAI_GALLERY_URL: &str = "https://nhentai.net/api/v2/galleries/"; // nhentai v2 gallery detail api url base, hentai id is appended, also base for archive download endpoint
+    const NHENTAI_SEARCH_URL: &str = "https://nhentai.net/api/v2/search"; // nhentai v2 search by query api url
+    let archive_mode: ArchiveDownloadMode = config.ARCHIVE_DOWNLOAD_MODE.clone().unwrap_or_default(); // how to obtain the cbz
+    let archive_rate_limiter: std::sync::Arc<ArchiveRateLimiter> = std::sync::Arc::new(ArchiveRateLimiter::new(config.ARCHIVE_MIN_INTERVAL_SECONDS.unwrap_or(45))); // pace requests to the archive endpoint, shared across all downloads
+    let has_api_key: bool = config.NHENTAI_API_KEY.as_ref().is_some_and(|key| !key.is_empty()); // if an api key is configured, required for the archive endpoint
     let http_client: wreq::Client; // http client
     let f0 = scaler::Formatter::new()
         .set_scaling(scaler::Scaling::None)
@@ -22,20 +26,38 @@ pub async fn main_inner(config: Config) -> Result<(), Error>
     let f4 = scaler::Formatter::new(); // formatter
 
 
+    if archive_mode == ArchiveDownloadMode::Enforce && !has_api_key // if archive download mode enforces archive endpoint but no api key is configured: nothing would ever download
+    {
+        return Err(Error::SettingInvalid {reason: "Setting `ARCHIVE_DOWNLOAD_MODE` is set to \"ENFORCE\", but no `NHENTAI_API_KEY` is configured. The archive download endpoint requires an API key. Generate one at https://nhentai.net/user/settings#apikeys or use a different archive download mode.".to_owned()});
+    }
+
     let mut headers= wreq::header::HeaderMap::new(); // http request headers
-                match wreq::header::HeaderValue::from_str(config.USER_AGENT.as_deref().unwrap_or_default()) // set user agent
-                {
-                    Ok(o) => _ = headers.insert(wreq::header::USER_AGENT, o),
+    match wreq::header::HeaderValue::from_str(config.USER_AGENT.as_deref().unwrap_or_default()) // set user agent
+    {
+        Ok(o) => _ = headers.insert(wreq::header::USER_AGENT, o),
         Err(e) => log::warn!("Adding user agent to HTTP client headers failed with: {e}\nUsing empty user agent instead."),
     }
-                match wreq::Client::builder()  // create http client
-                    .connect_timeout(std::time::Duration::from_secs(HTTP_TIMEOUT))
-                    .cookie_store(true) // enable cookies
-                    .default_headers(headers)
-                    .read_timeout(std::time::Duration::from_secs(HTTP_TIMEOUT))
-                    .build()
-                {
-                    Ok(o) => http_client = o,
+    headers.insert(wreq::header::ACCEPT, wreq::header::HeaderValue::from_static("application/json")); // request json responses
+    if let Some(api_key) = config.NHENTAI_API_KEY.as_ref().filter(|key| !key.is_empty()) // if api key is configured: add authorization header
+    {
+        match wreq::header::HeaderValue::from_str(format!("Key {api_key}").as_str())
+        {
+            Ok(mut o) =>
+            {
+                o.set_sensitive(true); // don't leak api key in logs
+                headers.insert(wreq::header::AUTHORIZATION, o);
+                log::info!("Using configured nhentai.net API key.");
+            }
+            Err(e) => log::warn!("Adding nhentai.net API key to HTTP client headers failed with: {e}\nProceeding without API key."),
+        }
+    }
+    match wreq::Client::builder()  // create http client
+        .connect_timeout(std::time::Duration::from_secs(HTTP_TIMEOUT))
+        .default_headers(headers)
+        .read_timeout(std::time::Duration::from_secs(HTTP_TIMEOUT))
+        .build()
+    {
+        Ok(o) => http_client = o,
         Err(e) => return Err(Error::WreqClientBuilder {source: e}),
     }
 
@@ -50,7 +72,7 @@ pub async fn main_inner(config: Config) -> Result<(), Error>
 
             log::debug!("Test connecting to nhentai.net...");
             let r;
-                match http_client.get(NHENTAI_TAG_SEARCH_URL).query(&[("query", "language:english"), ("page", "1")]).send().await // send test request
+                match http_client.get(NHENTAI_CDN_URL).send().await // send test request to public cdn config endpoint
                 {
                     Ok(o) => r = o,
                     Err(e) =>
@@ -86,9 +108,8 @@ pub async fn main_inner(config: Config) -> Result<(), Error>
                         &config.DOWNLOADME_FILEPATH,
                         &config.DONTDOWNLOADME_FILEPATH,
                         &http_client,
-                        NHENTAI_TAG_SEARCH_URL,
+                        NHENTAI_SEARCH_URL,
                         config.NHENTAI_TAGS.clone(),
-                        &db,
                     ).await;
 
 
@@ -104,7 +125,7 @@ pub async fn main_inner(config: Config) -> Result<(), Error>
                             *hentai_id,
                             &db,
                             &http_client,
-                            NHENTAI_HENTAI_SEARCH_URL,
+                            NHENTAI_GALLERY_URL,
                             &config.FILENAME_TITLE_TYPE.clone().unwrap_or_default(), // if not set: default to english title
                             &config.LIBRARY_PATH,
                             config.LIBRARY_SPLIT.unwrap_or_default(), // use u32 with 0 to disable library split and not Option<u32> with None, because that would make Some(0) an invalid state
@@ -122,7 +143,7 @@ pub async fn main_inner(config: Config) -> Result<(), Error>
                     {
                     return Err(Error::SettingInvalid {reason: format!("Setting `DOWNLOAD_WORKERS` must have value greater than 0 or else nothing gets done.")});
                     }
-                    if let Err(e) = hentai.download(&http_client, config.DOWNLOAD_WORKERS.unwrap_or(5), config.CIRCUMVENT_LOAD_BALANCER.unwrap_or(false), config.CLEANUP_TEMPORARY_FILES.unwrap_or(true)).await
+                    if let Err(e) = hentai.download(&http_client, config.DOWNLOAD_WORKERS.unwrap_or(5), config.CIRCUMVENT_LOAD_BALANCER.unwrap_or(false), config.CLEANUP_TEMPORARY_FILES.unwrap_or(true), &archive_mode, Some(archive_rate_limiter.as_ref()), has_api_key, NHENTAI_GALLERY_URL).await
                     {
                     log::error!{"{e}"};
                     }

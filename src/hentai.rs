@@ -157,28 +157,23 @@ impl Hentai
 
 
     /// # Summary
-    /// Downloads all images of the hentai and combines them into a cbz file.
+    /// Downloads the hentai and combines it into a cbz file. Depending on `archive_mode` either uses nhentai.net's official archive download endpoint (and embeds the ComicInfo.xml afterwards) or downloads all images individually.
     ///
     /// # Arguments
     /// - `http_client`: wreq http client
-    /// - `download_workers`: number of workers for parallel downloads, if 0: error
+    /// - `download_workers`: number of workers for parallel image downloads, if 0: error
     /// - `circumvent_load_balancer`: if nhentai.net's load balancer should be circumvented and directly use random media server, only use if load balancer is broken
     /// - `cleanup_temporary_files`: if temporary files should be cleaned up after download, if false: temporary images and ComicInfo.xml remain in library
+    /// - `archive_mode`: how to obtain the cbz: Enforce, Prefer, or Never use the archive endpoint
+    /// - `archive_rate_limiter`: shared rate limiter to pace requests to the archive endpoint, None to not pace
+    /// - `has_api_key`: if an nhentai.net API key is configured, the archive endpoint requires it
+    /// - `nhentai_download_api_url`: nhentai.net v2 archive download API URL base, hentai ID and "/download?format=cbz" are appended
     ///
     /// # Returns
     /// - nothing or error
-    pub async fn download(&self, http_client: &wreq::Client, download_workers: usize, circumvent_load_balancer: bool, cleanup_temporary_files: bool) -> Result<(), HentaiDownloadError>
+    pub async fn download(&self, http_client: &wreq::Client, download_workers: usize, circumvent_load_balancer: bool, cleanup_temporary_files: bool, archive_mode: &ArchiveDownloadMode, archive_rate_limiter: Option<&ArchiveRateLimiter>, has_api_key: bool, nhentai_download_api_url: &str) -> Result<(), HentaiDownloadError>
     {
-        let cbz_final_filepath: String; //filepath to final cbz in library
-        let cbz_temp_filepath: String = format!("{}{}/{}.temp", self.library_path, self.id, self.id); //filepath to temporary cbz, cbz is created here and when finished moved to final location, roundabout way over temporary cbz filepath in case program gets stopped while creating cbz, so no half finished cbz remains in library, don't use real filename because appending "".temp" might then bust length limit
-        let comicinfoxml_filepath: String = format!("{}{}/ComicInfo.xml", self.library_path, self.id); // filepath to metadata file if cleanup_temporary_files is false
-        let f = scaler::Formatter::new()
-            .set_scaling(scaler::Scaling::None)
-            .set_rounding(scaler::Rounding::Magnitude(0)); // formatter
-        let mut image_download_success: bool = true; // if all images were downloaded successfully, redundant initialisation here because of stupid error message
-        let mut handles: Vec<tokio::task::JoinHandle<Option<()>>>; // list of handles to download_image
-        let worker_sem: std::sync::Arc<tokio::sync::Semaphore> = std::sync::Arc::new(tokio::sync::Semaphore::new(download_workers)); // limit number of concurrent workers otherwise api enforces rate limit
-        let mut zip_writer: zip::ZipWriter<std::fs::File>; // write to zip file
+        let cbz_final_filepath: String; // filepath to final cbz in library
 
 
         cbz_final_filepath = match self.library_split // determine final cbz filepath
@@ -200,6 +195,189 @@ impl Hentai
                 return Err(HentaiDownloadError::BlockedByDirectory {directory_path: cbz_final_filepath.clone()}); // give up
             }
         }
+
+        match archive_mode
+        {
+            ArchiveDownloadMode::Never => // never use archive endpoint, always download images individually
+            {
+                return self.download_via_images(http_client, download_workers, circumvent_load_balancer, cleanup_temporary_files, &cbz_final_filepath).await;
+            }
+            ArchiveDownloadMode::Enforce => // only use archive endpoint, error out on failure
+            {
+                if !has_api_key {return Err(HentaiDownloadError::ArchiveUnavailable);} // archive endpoint requires API key
+                return self.download_via_archive(http_client, nhentai_download_api_url, archive_rate_limiter, cleanup_temporary_files, &cbz_final_filepath).await;
+            }
+            ArchiveDownloadMode::Prefer => // use archive endpoint, fall back to images on serious endpoint failure
+            {
+                if !has_api_key // archive endpoint requires API key, without it fall straight back to images
+                {
+                    log::info!("No nhentai.net API key configured. Downloading individual images instead of using the archive endpoint.");
+                    return self.download_via_images(http_client, download_workers, circumvent_load_balancer, cleanup_temporary_files, &cbz_final_filepath).await;
+                }
+                match self.download_via_archive(http_client, nhentai_download_api_url, archive_rate_limiter, cleanup_temporary_files, &cbz_final_filepath).await
+                {
+                    Ok(_) => return Ok(()),
+                    Err(e @ (HentaiDownloadError::ArchiveUnavailable | HentaiDownloadError::ArchiveStatus {..} | HentaiDownloadError::ArchiveWreq(_) | HentaiDownloadError::ArchiveSerdeJson(_))) => // serious archive endpoint issue: fall back to images
+                    {
+                        log::warn!("Downloading hentai archive failed with: {e} Falling back to downloading individual images...");
+                        return self.download_via_images(http_client, download_workers, circumvent_load_balancer, cleanup_temporary_files, &cbz_final_filepath).await;
+                    }
+                    Err(e) => return Err(e), // local problem (zip, io, xml): propagate, don't hammer image servers
+                }
+            }
+        }
+    }
+
+
+    /// # Summary
+    /// Downloads the hentai's cbz directly from nhentai.net's archive download endpoint and embeds the ComicInfo.xml afterwards.
+    ///
+    /// # Arguments
+    /// - `http_client`: wreq http client
+    /// - `nhentai_download_api_url`: nhentai.net v2 archive download API URL base, hentai ID and "/download?format=cbz" are appended
+    /// - `archive_rate_limiter`: shared rate limiter to pace requests to the archive endpoint, None to not pace
+    /// - `cleanup_temporary_files`: if false: additionally writes ComicInfo.xml beside the cbz
+    /// - `cbz_final_filepath`: filepath to final cbz in library
+    ///
+    /// # Returns
+    /// - nothing or error
+    async fn download_via_archive(&self, http_client: &wreq::Client, nhentai_download_api_url: &str, archive_rate_limiter: Option<&ArchiveRateLimiter>, cleanup_temporary_files: bool, cbz_final_filepath: &str) -> Result<(), HentaiDownloadError>
+    {
+        const ARCHIVE_RETRIES_MAX: u8 = 3; // maximum number of retries on rate limit before giving up on the archive endpoint
+        let api_url: String = format!("{nhentai_download_api_url}{}/download?format=cbz", self.id); // archive download endpoint url
+        let cbz_temp_filepath: String = format!("{}{}/{}.temp", self.library_path, self.id, self.id); // filepath to temporary cbz, downloaded here and moved to final location when finished
+        let comicinfoxml_filepath: String = format!("{}{}/ComicInfo.xml", self.library_path, self.id); // filepath to metadata file if cleanup_temporary_files is false
+        let download_url: String; // short lived presigned url to actual cbz
+
+
+        let mut retries: u8 = 0;
+        loop // request presigned download url, retrying on rate limit
+        {
+            let r;
+            if let Some(rate_limiter) = archive_rate_limiter {rate_limiter.wait().await;} // pace requests to the archive endpoint
+            match http_client.post(api_url.as_str()).send().await // request presigned download url
+            {
+                Ok(o) => r = o,
+                Err(e) => return Err(HentaiDownloadError::ArchiveWreq(e)),
+            }
+            log::debug!("{}", r.status());
+            if r.status() == wreq::StatusCode::TOO_MANY_REQUESTS // if rate limited: back off and retry, don't fall back to images
+            {
+                retries += 1;
+                if ARCHIVE_RETRIES_MAX < retries {return Err(HentaiDownloadError::ArchiveStatus {url: api_url, status: r.status()});} // give up on the archive endpoint after too many retries
+                log::warn!("Downloading hentai archive from \"{api_url}\" failed with status code {}. Backing off and retrying ({} / {})...", r.status(), retries, ARCHIVE_RETRIES_MAX);
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                continue;
+            }
+            if r.status() == wreq::StatusCode::SERVICE_UNAVAILABLE {return Err(HentaiDownloadError::ArchiveUnavailable);} // downloads disabled for this gallery
+            if r.status() != wreq::StatusCode::OK {return Err(HentaiDownloadError::ArchiveStatus {url: api_url, status: r.status()});} // something else went wrong
+            let download_response: DownloadResponse = serde_json::from_str(r.text().await.map_err(HentaiDownloadError::ArchiveWreq)?.as_str())?; // deserialise presigned download url
+            download_url = download_response.url;
+            break;
+        }
+
+        let cbz_bytes;
+        {
+            let r = http_client.get(download_url.as_str()).send().await.map_err(HentaiDownloadError::ArchiveWreq)?; // download cbz from presigned url
+            log::debug!("{}", r.status());
+            if r.status() != wreq::StatusCode::OK {return Err(HentaiDownloadError::ArchiveStatus {url: download_url, status: r.status()});} // if status is not ok: something went wrong
+            cbz_bytes = r.bytes().await.map_err(HentaiDownloadError::ArchiveWreq)?; // read cbz into memory
+        }
+        log::info!("Downloaded hentai archive.");
+
+
+        #[cfg(target_family = "unix")]
+        {
+            tokio::fs::DirBuilder::new().recursive(true).mode(0o777).create(std::path::Path::new(format!("{}{}", self.library_path, self.id).as_str())).await?; // create all parent directories with permissions "drwxrwxrwx"
+        }
+        #[cfg(not(target_family = "unix"))]
+        {
+            tokio::fs::DirBuilder::new().recursive(true).create(std::path::Path::new(format!("{}{}", self.library_path, self.id).as_str())).await?; // create all parent directories
+        }
+        tokio::fs::write(cbz_temp_filepath.as_str(), &cbz_bytes).await?; // write downloaded cbz to temporary location
+
+        let cbz_file: std::fs::File = std::fs::OpenOptions::new().read(true).write(true).open(cbz_temp_filepath.as_str())?; // open temporary cbz for in place modification
+        #[cfg(target_family = "unix")]
+        if let Err(e) = cbz_file.set_permissions(std::fs::Permissions::from_mode(0o666)) // set permissions "rw-rw-rw-"
+        {
+            log::warn!("Setting permissions \"rw-rw-rw-\" for hentai {} failed with: {e}", self.id);
+        }
+        let mut zip_writer: zip::ZipWriter<std::fs::File> = zip::ZipWriter::new_append(cbz_file)?; // append to existing cbz
+        #[cfg(target_family = "unix")]
+        zip_writer.start_file("ComicInfo.xml", zip::write::SimpleFileOptions::default().unix_permissions(0o666))?; // create metadata file in cbz with permissions "rw-rw-rw-"
+        #[cfg(not(target_family = "unix"))]
+        zip_writer.start_file("ComicInfo.xml", zip::write::SimpleFileOptions::default())?; // create metadata file in cbz without permissions
+        zip_writer.write_all(serde_xml_rs::to_string(&ComicInfo::from(self.clone()))?.as_bytes())?; // write metadata into cbz
+        zip_writer.finish()?; // finish temporary cbz
+
+        #[cfg(target_family = "unix")]
+        {
+            if let Some(parent) = std::path::Path::new(cbz_final_filepath).parent() {tokio::fs::DirBuilder::new().recursive(true).mode(0o777).create(parent).await?;} // create all parent directories with permissions "drwxrwxrwx"
+        }
+        #[cfg(not(target_family = "unix"))]
+        {
+            if let Some(parent) = std::path::Path::new(cbz_final_filepath).parent() {tokio::fs::DirBuilder::new().recursive(true).create(parent).await?;} // create all parent directories
+        }
+        tokio::fs::rename(cbz_temp_filepath.as_str(), cbz_final_filepath).await?; // move finished cbz to final location in library
+        log::info!("Saved hentai cbz at \"{cbz_final_filepath}\".");
+
+        if !cleanup_temporary_files // if temporary files should not be cleaned up: additionally write ComicInfo.xml beside the cbz
+        {
+            #[cfg(target_family = "unix")]
+            match tokio::fs::OpenOptions::new().create_new(true).mode(0o666).write(true).open(&comicinfoxml_filepath).await
+            {
+                Ok(mut file) =>
+                {
+                    match file.write_all(serde_xml_rs::to_string(&ComicInfo::from(self.clone()))?.as_bytes()).await
+                    {
+                        Ok(_) => log::info!("Saved hentai metadata file at \"{comicinfoxml_filepath}\"."),
+                        Err(e) => log::warn!("Writing hentai metadata to \"{comicinfoxml_filepath}\" failed with: {e}"),
+                    }
+                },
+                Err(e) => log::warn!("Saving hentai metadata at \"{comicinfoxml_filepath}\" failed with: {e}"),
+            }
+            #[cfg(not(target_family = "unix"))]
+            match tokio::fs::OpenOptions::new().create_new(true).write(true).open(&comicinfoxml_filepath).await
+            {
+                Ok(mut file) =>
+                {
+                    match file.write_all(serde_xml_rs::to_string(&ComicInfo::from(self.clone()))?.as_bytes()).await
+                    {
+                        Ok(_) => log::info!("Saved hentai metadata file."),
+                        Err(e) => log::warn!("Writing hentai metadata to \"{comicinfoxml_filepath}\" failed with: {e}"),
+                    }
+                },
+                Err(e) => log::warn!("Saving hentai metadata at \"{comicinfoxml_filepath}\" failed with: {e}"),
+            }
+        }
+
+        return Ok(());
+    }
+
+
+    /// # Summary
+    /// Downloads all images of the hentai individually and combines them into a cbz file.
+    ///
+    /// # Arguments
+    /// - `http_client`: wreq http client
+    /// - `download_workers`: number of workers for parallel downloads, if 0: error
+    /// - `circumvent_load_balancer`: if nhentai.net's load balancer should be circumvented and directly use random media server, only use if load balancer is broken
+    /// - `cleanup_temporary_files`: if temporary files should be cleaned up after download, if false: temporary images and ComicInfo.xml remain in library
+    /// - `cbz_final_filepath`: filepath to final cbz in library
+    ///
+    /// # Returns
+    /// - nothing or error
+    async fn download_via_images(&self, http_client: &wreq::Client, download_workers: usize, circumvent_load_balancer: bool, cleanup_temporary_files: bool, cbz_final_filepath: &str) -> Result<(), HentaiDownloadError>
+    {
+        let cbz_temp_filepath: String = format!("{}{}/{}.temp", self.library_path, self.id, self.id); //filepath to temporary cbz, cbz is created here and when finished moved to final location, roundabout way over temporary cbz filepath in case program gets stopped while creating cbz, so no half finished cbz remains in library, don't use real filename because appending "".temp" might then bust length limit
+        let comicinfoxml_filepath: String = format!("{}{}/ComicInfo.xml", self.library_path, self.id); // filepath to metadata file if cleanup_temporary_files is false
+        let f = scaler::Formatter::new()
+            .set_scaling(scaler::Scaling::None)
+            .set_rounding(scaler::Rounding::Magnitude(0)); // formatter
+        let mut image_download_success: bool = true; // if all images were downloaded successfully, redundant initialisation here because of stupid error message
+        let mut handles: Vec<tokio::task::JoinHandle<Option<()>>>; // list of handles to download_image
+        let worker_sem: std::sync::Arc<tokio::sync::Semaphore> = std::sync::Arc::new(tokio::sync::Semaphore::new(download_workers)); // limit number of concurrent workers otherwise api enforces rate limit
+        let mut zip_writer: zip::ZipWriter<std::fs::File>; // write to zip file
 
 
         for _ in 0..5 // try to download hentai maximum 5 times
@@ -280,13 +458,13 @@ impl Hentai
 
         #[cfg(target_family = "unix")]
         {
-            if let Some(parent) = std::path::Path::new(cbz_final_filepath.as_str()).parent() {tokio::fs::DirBuilder::new().recursive(true).mode(0o777).create(parent).await?;} // create all parent directories of with permissions "drwxrwxrwx"
+            if let Some(parent) = std::path::Path::new(cbz_final_filepath).parent() {tokio::fs::DirBuilder::new().recursive(true).mode(0o777).create(parent).await?;} // create all parent directories of with permissions "drwxrwxrwx"
         }
         #[cfg(not(target_family = "unix"))]
         {
-            if let Some(parent) = std::path::Path::new(cbz_final_filepath.as_str()).parent() {tokio::fs::DirBuilder::new().recursive(true).create(parent).await?;} // create all parent directories
+            if let Some(parent) = std::path::Path::new(cbz_final_filepath).parent() {tokio::fs::DirBuilder::new().recursive(true).create(parent).await?;} // create all parent directories
         }
-        tokio::fs::rename(cbz_temp_filepath, &cbz_final_filepath).await?; // move finished cbz to final location in library
+        tokio::fs::rename(cbz_temp_filepath, cbz_final_filepath).await?; // move finished cbz to final location in library
         log::info!("Saved hentai cbz at \"{cbz_final_filepath}\".");
 
 
@@ -442,4 +620,52 @@ pub struct HentaiTableRow
     pub title_japanese: Option<String>,
     pub title_pretty: Option<String>,
     pub upload_date: chrono::DateTime<chrono::Utc>,
+}
+
+
+/// # Summary
+/// Paces requests to nhentai.net's archive download endpoint to respect its rate limit. Enforces a minimum interval between two consecutive requests across all concurrent workers.
+#[derive(Debug)]
+pub struct ArchiveRateLimiter
+{
+    min_interval: std::time::Duration, // minimum time between two requests
+    last_request: tokio::sync::Mutex<Option<std::time::Instant>>, // when the last request was started, None if none yet
+}
+
+impl ArchiveRateLimiter
+{
+    /// # Summary
+    /// Creates a new rate limiter with the given minimum interval between requests.
+    ///
+    /// # Arguments
+    /// - `min_interval_seconds`: minimum number of seconds between two requests
+    ///
+    /// # Returns
+    /// - new ArchiveRateLimiter
+    pub fn new(min_interval_seconds: u64) -> Self
+    {
+        return Self
+        {
+            min_interval: std::time::Duration::from_secs(min_interval_seconds),
+            last_request: tokio::sync::Mutex::new(None),
+        };
+    }
+
+    /// # Summary
+    /// Waits until the minimum interval since the last request has elapsed, then records the current time as the new last request. Holds the internal lock across the wait so that all callers are serialised and spaced apart.
+    pub async fn wait(&self)
+    {
+        let mut last_request = self.last_request.lock().await; // serialise all callers
+        if let Some(last) = *last_request
+        {
+            let elapsed: std::time::Duration = last.elapsed();
+            if elapsed < self.min_interval
+            {
+                let remaining: std::time::Duration = self.min_interval - elapsed;
+                log::debug!("Waiting {} s before next archive request...", remaining.as_secs_f64());
+                tokio::time::sleep(remaining).await;
+            }
+        }
+        *last_request = Some(std::time::Instant::now()); // record this request
+    }
 }

@@ -23,9 +23,22 @@ I'm happy about anyone who finds my software useful and feedback is also always 
 
 1. Execute the program once to create a default `./config/.env`.\
     This means that in the directory of the executable, there should now be a directory called "config" containing a file called ".env". You might need to enable seeing hidden files in the file explorer.
-1. I recommend updating the `USER_AGENT` to your system's specific user agent. You can go to https://www.whatismybrowser.com/detect/ and copy your user agent into there.
+1. Optionally configure an nHentai API key (`NHENTAI_API_KEY`) to enable the official archive download endpoint. See [Further Settings](#further-settings) below.
 
 ## Further Settings
+- `ARCHIVE_DOWNLOAD_MODE`, optional, defaults to `PREFER`
+
+    Determines how the CBZ files are obtained. Available settings:
+    - `ENFORCE`: Only use nHentai's official archive download endpoint. Requires `NHENTAI_API_KEY` to be set, otherwise the program aborts. Galleries that cannot be downloaded via the archive endpoint are skipped.
+    - `PREFER`: Use the official archive download endpoint if a `NHENTAI_API_KEY` is configured, and only fall back to downloading individual images if the archive endpoint has a serious problem (for example downloads being disabled for that gallery). If no API key is configured, individual images are downloaded directly.
+    - `NEVER`: Never use the archive download endpoint, always download individual images. This is the legacy behaviour and does not require an API key.
+
+    The archive endpoint downloads the gallery as a single CBZ directly from nHentai. Because the official CBZ does not contain full metadata, a `ComicInfo.xml` is embedded afterwards just like with the individual image download method.
+
+- `ARCHIVE_MIN_INTERVAL_SECONDS`, optional, defaults to $45$
+
+    Minimum number of seconds to wait between two requests to the archive download endpoint. nHentai rate limits the archive endpoint quite strictly. This setting is configurable so that, should nHentai change their rate limit, it can be adjusted without a new release. Increase it if you encounter frequent rate limiting, decrease it cautiously if you are sure nHentai allows it.
+
 - `CIRCUMVENT_LOAD_BALANCER`, optional, defaults to `false`
 
     Setting this to `true` circumvents the load balancer at `i.nhentai.net` and directly uses a random media server, for example `i2.nhentai.net`. Only use this if the load balancer is broken. You can confirm this by setting `DEBUG = true` and checking the logs for consistent download errors when using `i.nhentai.net` and success when using a specific media server like `i2.nhentai.net`.
@@ -67,6 +80,23 @@ I'm happy about anyone who finds my software useful and feedback is also always 
 - `LIBRARY_SPLIT`, optional, defaults to `0`
 
     Setting this to a value other than 0 splits the library at `LIBRARY_PATH` into sub-directories with a maximum number of `LIBRARY_SPLIT` hentai allowed per sub-directory. It is recommended if the number of hentai in 1 directory starts to affect file explorer performance. This _should_ not affect you if you plan to keep less than 10.000 files in your `LIBRARY_PATH` directory, otherwise the recommended setting is `LIBRARY_SPLIT = 10000`.
+
+- `NHENTAI_API_KEY`, optional, defaults to `None`
+
+    Your personal nHentai API key. It is required to use the official archive download endpoint (see `ARCHIVE_DOWNLOAD_MODE`). Without it, the program falls back to downloading individual images. Generate a key at https://nhentai.net/user/settings#apikeys while logged in. Keep it secret, the program sends it only to nHentai.
+
+    `./config/.env` example:
+
+    ```TOML
+    NHENTAI_API_KEY = "your api key here"
+    ```
+
+    `docker-compose.yaml` example:
+
+    ```YAML
+    environment:
+        NHENTAI_API_KEY: "your api key here"
+    ```
 
 - `NHENTAI_TAGS`, optional, defaults to `None` (client mode)
 
@@ -126,7 +156,7 @@ Example `./config/.env`:
 DONTDOWNLOADME_FILEPATH = "./config/dontdownloadme.txt"
 DOWNLOADME_FILEPATH = "./config/downloadme.txt"
 LIBRARY_PATH = "./hentai/"
-USER_AGENT = "your user agent here"
+# NHENTAI_API_KEY = "your api key here" # optional, enables the official archive download endpoint
 ```
 
 ### Ich mein's ernst: Keeping a Self-Hosted Library Up-to-Date
@@ -146,7 +176,7 @@ LIBRARY_PATH = "./hentai/"
 LIBRARY_SPLIT = 10000
 NHENTAI_TAGS = ['language:"english"']
 SLEEP_INTERVAL = 50000
-USER_AGENT = "your user agent here"
+# NHENTAI_API_KEY = "your api key here" # optional, enables the official archive download endpoint
 ```
 
 ## Exporting Favourites

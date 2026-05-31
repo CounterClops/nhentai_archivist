@@ -15,11 +15,10 @@ use tokio::io::AsyncWriteExt;
 /// - `http_client`: wreq http client
 /// - `nhentai_tag_search_url`: nhentai.net tag search API URL
 /// - `nhentai_tags`: tags to search for
-/// - `db`: database connection
 ///
 /// # Returns
 /// - list of hentai ID to download
-pub async fn get_hentai_id_list(downloadme_filepath: &Option<String>, dontdownloadme_filepath: &Option<String>, http_client: &wreq::Client, nhentai_tag_search_url: &str, nhentai_tags: Option<Vec<String>>, db: &sqlx::sqlite::SqlitePool) -> Vec<u32>
+pub async fn get_hentai_id_list(downloadme_filepath: &Option<String>, dontdownloadme_filepath: &Option<String>, http_client: &wreq::Client, nhentai_tag_search_url: &str, nhentai_tags: Option<Vec<String>>) -> Vec<u32>
 {
     let mut hentai_id_list: Vec<u32> = Vec::new(); // list of hentai id to download
 
@@ -61,7 +60,6 @@ pub async fn get_hentai_id_list(downloadme_filepath: &Option<String>, dontdownlo
             http_client,
             nhentai_tag_search_url,
             &nhentai_tags.expect("nhentai_tags lifting crashed even though previous line ensured Option is Some."),
-            db,
         ).await
         {
             Ok(o) => hentai_id_list = o,

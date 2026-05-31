@@ -49,6 +49,18 @@ pub enum HentaiDownloadError
     #[error("Downloading hentai failed multiple times. Giving up...")]
     Download(), // download failed multiple times, more specific error messages already in download logged
 
+    #[error("Downloading hentai archive from \"{}\" failed with: {}", .0.url().map_or_else(|| "<unknown>", |o| o.as_str()), .0)]
+    ArchiveWreq(#[from] wreq::Error), // archive endpoint connection error
+
+    #[error("Downloading hentai archive from \"{url}\" failed with status code {status}.")]
+    ArchiveStatus {url: String, status: wreq::StatusCode}, // archive endpoint returned non success status
+
+    #[error("Deserialising hentai archive download response failed with: {0}")]
+    ArchiveSerdeJson(#[from] serde_json::Error), // deserialising archive download response failed
+
+    #[error("Hentai archive download endpoint is unavailable (downloads disabled or no API key) and archive download mode is set to enforce. Giving up...")]
+    ArchiveUnavailable, // archive endpoint not usable but mode requires it
+
     #[error("Serialising hentai metadata failed with: {0}")]
     SerdeXml(#[from] serde_xml_rs::Error), // serde xml error
 

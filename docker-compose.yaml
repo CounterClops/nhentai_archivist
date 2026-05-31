@@ -5,6 +5,10 @@ services:
         container_name: "nhentai_archivist"
         image: "ghcr.io/9-fs/nhentai_archivist:latest"
         mem_limit: "1G"
+        # environment:
+        #     NHENTAI_API_KEY: "your api key here" # optional, enables the official archive download endpoint, generate at https://nhentai.net/user/settings#apikeys
+        #     ARCHIVE_DOWNLOAD_MODE: "PREFER" # optional, one of ENFORCE, PREFER, NEVER, defaults to PREFER
+        #     ARCHIVE_MIN_INTERVAL_SECONDS: 45 # optional, minimum seconds between archive endpoint requests, defaults to 45
         volumes:
             - "/path/to/nhentai_archivist/config/:/app/config/"
             - "/path/to/nhentai_archivist/db/:/app/db/"
